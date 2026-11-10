@@ -205,7 +205,7 @@ int actor_main(int actor)
         long long now = now_ms();
         if (now == -1 || delay_ms(people[actor - config.lifts - 1].arrival - now) == -1)
             return -1;
-        if (send_message(0, (Message){ APPEAR, actor, 0 }) == -1)
+        if (send_message(0, (Message){ .kind = APPEAR, .actor = actor }) == -1)
             return -1;
     }
     for (;;) {
@@ -252,7 +252,7 @@ static int lift_command(int j, int kind)
                    kind == OPEN ? "открытие" : "закрытие", l->floor) == -1)
             return -1;
     }
-    return send_message(j + 1, (Message){ kind, 0, value });
+    return send_message(j + 1, (Message){ .kind = kind, .value = value });
 }
 
 static int approach(int j)
@@ -275,7 +275,7 @@ static int transfer(int j)
             if (report("Пассажир %d: начало %s, лифт %d, этаж %d", i + 1,
                        l->pickup ? "посадки" : "высадки", j + 1, l->floor) == -1)
                 return -1;
-            return send_message(config.lifts + 1 + i, (Message){ kind, 0, j });
+            return send_message(config.lifts + 1 + i, (Message){ .kind = kind, .value = j });
         }
     }
     return lift_command(j, CLOSE);

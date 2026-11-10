@@ -11,6 +11,9 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#ifdef MESSAGE_QUEUES
+#include <mqueue.h>
+#endif
 
 /* Независимый запуск: elevator-server INPUT SESSION [LOG], затем
  * elevator-client INPUT SESSION ACTOR для каждого номера 1..L+P.
@@ -67,10 +70,10 @@ static int check_peers(void)
             return -1;
         }
     }
-    if (client) {
+    if (client && session->server > 0) {
         if (kill(session->server, 0) == -1)
             return -1;
-    } else if (!closing) {
+    } else if (!client && !closing) {
         for (int i = 0; i < actors; ++i) {
             if (pids[i] && kill(pids[i], 0) == -1)
                 return -1;
@@ -85,13 +88,87 @@ static int check_peers(void)
  * а независимые участники получают собственные через sem_open. */
 static sem_t **semaphores;
 
-static int semaphore_name(char *buffer, size_t size, const char *prefix, size_t index)
+static int object_name(char *buffer, size_t size, const char *prefix, size_t index)
 {
     int length = snprintf(buffer, size, "%s_%zu", prefix, index);
     if (length < 0 || (size_t)length >= size) {
         errno = EOVERFLOW;
         return -1;
     }
+    return 0;
+}
+#endif
+
+#ifdef MESSAGE_QUEUES
+static mqd_t *queues, reply_queue = (mqd_t)-1;
+static char reply_name[96];
+static int reply_created;
+
+static int reply_queue_name(char *buffer, size_t size, const char *prefix, pid_t pid)
+{
+    int length = snprintf(buffer, size, "%s_reply_%ld", prefix, (long)pid);
+    if (length < 0 || (size_t)length >= size) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    return 0;
+}
+
+/* У регистрации своя очередь по PID. Поэтому отказ второму клиенту
+ * с тем же номером не попадёт в очередь уже работающего участника. */
+static int registration_reply(const char *prefix, pid_t pid, int error)
+{
+    char name[96];
+    if (reply_queue_name(name, sizeof name, prefix, pid) == -1)
+        return -1;
+    mqd_t queue = mq_open(name, O_WRONLY | O_NONBLOCK);
+    if (queue == (mqd_t)-1)
+        return -1;
+    Message message = { .kind = error ? REJECT : REGISTER,
+                       .value = error ? error : (int)getpid() };
+    int result = mq_send(queue, (const char *)&message, sizeof message, 0);
+    int saved = errno;
+    if (mq_close(queue) == -1) {
+        result = -1;
+        saved = errno;
+    }
+    if (mq_unlink(name) == -1 && errno != ENOENT) {
+        result = -1;
+        saved = errno;
+    }
+    errno = saved;
+    return result;
+}
+
+static int register_client(const char *prefix, int actor)
+{
+    if (reply_queue_name(reply_name, sizeof reply_name, prefix, getpid()) == -1)
+        return -1;
+    struct mq_attr attributes = { .mq_maxmsg = 1, .mq_msgsize = sizeof(Message) };
+    reply_queue = mq_open(reply_name, O_CREAT | O_EXCL | O_RDWR, 0600, &attributes);
+    if (reply_queue == (mqd_t)-1)
+        return -1;
+    reply_created = 1;
+    Message message = { .kind = REGISTER, .actor = actor,
+                        .value = (int)getpid(), .config = config };
+    if (send_message(0, message) == -1)
+        return -1;
+    struct timespec deadline;
+    if (clock_gettime(CLOCK_REALTIME, &deadline) == -1)
+        return -1;
+    deadline.tv_sec += 5;
+    ssize_t received;
+    do {
+        received = mq_timedreceive(reply_queue, (char *)&message, sizeof message, NULL, &deadline);
+    } while (received == -1 && errno == EINTR && !stop_signal);
+    if (received == -1)
+        return -1;
+    if (received != (ssize_t)sizeof message || message.kind != REGISTER || message.value <= 0) {
+        errno = received == (ssize_t)sizeof message && message.kind == REJECT ?
+            message.value : EPROTO;
+        return -1;
+    }
+    session->server = (pid_t)message.value;
     return 0;
 }
 #endif
@@ -141,19 +218,32 @@ static int wait_sem(sem_t *sem)
 
 int send_message(int receiver, Message message)
 {
-    Mailbox *box = &boxes[receiver];
     if (wait_sem(box_sem(receiver, CAN_WRITE)) == -1)
         return -1;
-    box->message = message;
+#ifdef MESSAGE_QUEUES
+    if (mq_send(queues[receiver], (const char *)&message, sizeof message, 0) == -1)
+        return -1;
+#else
+    boxes[receiver].message = message;
+#endif
     return sem_post(box_sem(receiver, CAN_READ));
 }
 
 int receive_message(int receiver, Message *message)
 {
-    Mailbox *box = &boxes[receiver];
     if (wait_sem(box_sem(receiver, CAN_READ)) == -1)
         return -1;
-    *message = box->message;
+#ifdef MESSAGE_QUEUES
+    ssize_t received = mq_receive(queues[receiver], (char *)message, sizeof *message, NULL);
+    if (received == -1)
+        return -1;
+    if (received != (ssize_t)sizeof *message) {
+        errno = EPROTO;
+        return -1;
+    }
+#else
+    *message = boxes[receiver].message;
+#endif
 #ifdef INDEPENDENT
     /* BYE подтверждает окончание работы роли; waitpid для чужого ребёнка
      * неприменим. На ошибке модели это подтверждение тоже учитываем. */
@@ -209,6 +299,9 @@ int main(int argc, char **argv)
 #endif
     size_t count = (size_t)actors + 1, size = 0;
     char name[64];
+#ifdef MESSAGE_QUEUES
+    size_t opened_queues = 0;
+#endif
 #ifdef NAMED_SEMAPHORES
     char sem_name[96];
 #endif
@@ -227,7 +320,11 @@ int main(int argc, char **argv)
         errno = EINVAL;
         goto fail;
     }
+#ifdef MESSAGE_QUEUES
+    int length = snprintf(name, sizeof name, "/acos03_mq_%s", argv[2]);
+#else
     int length = snprintf(name, sizeof name, "/acos03_run_%s", argv[2]);
+#endif
 #else
     int length = snprintf(name, sizeof name, "/acos03_%ld", (long)getpid());
 #endif
@@ -266,12 +363,40 @@ int main(int argc, char **argv)
     }
 #ifdef INDEPENDENT
     if (client) {
-        if (semaphore_name(sem_name, sizeof sem_name, name, 2 * count) == -1)
+        if (object_name(sem_name, sizeof sem_name, name, SIZE_MAX) == -1)
             goto fail;
         ready = sem_open(sem_name, 0);
         if (ready == SEM_FAILED)
             goto fail;
     }
+#endif
+#ifdef MESSAGE_QUEUES
+    /* Здесь Session и boxes — обычная частная память процесса.
+     * Между процессами данные передаются исключительно через очереди. */
+    session = calloc(1, size);
+    if (!session) {
+        session = MAP_FAILED;
+        goto fail;
+    }
+    boxes = session->boxes;
+    queues = calloc(count, sizeof *queues);
+    if (!queues)
+        goto fail;
+    struct mq_attr attributes = { .mq_maxmsg = 1, .mq_msgsize = sizeof(Message) };
+    for (; opened_queues < count; ++opened_queues) {
+        if (object_name(sem_name, sizeof sem_name, name, opened_queues) == -1)
+            goto fail;
+        int flags = O_RDWR | O_NONBLOCK;
+        if (!client)
+            flags |= O_CREAT | O_EXCL;
+        queues[opened_queues] = mq_open(sem_name, flags, 0600, &attributes);
+        if (queues[opened_queues] == (mqd_t)-1)
+            goto fail;
+        if (!client)
+            created = 1;
+    }
+#else
+#ifdef INDEPENDENT
     fd = shm_open(name, client ? O_RDWR : O_CREAT | O_EXCL | O_RDWR, 0600);
 #else
     fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
@@ -308,6 +433,7 @@ int main(int argc, char **argv)
     fd = -1;
     if (close_result == -1)
         goto fail;
+#endif
 #ifdef NAMED_SEMAPHORES
     semaphores = calloc(2 * count, sizeof *semaphores);
     if (!semaphores)
@@ -315,7 +441,7 @@ int main(int argc, char **argv)
 #endif
     for (; initialized < 2 * count; ++initialized) {
 #ifdef NAMED_SEMAPHORES
-        if (semaphore_name(sem_name, sizeof sem_name, name, initialized) == -1)
+        if (object_name(sem_name, sizeof sem_name, name, initialized) == -1)
             goto fail;
 #ifdef INDEPENDENT
         int flags = client ? 0 : O_CREAT | O_EXCL;
@@ -334,6 +460,11 @@ int main(int argc, char **argv)
     }
 #ifdef INDEPENDENT
     if (client) {
+#ifdef MESSAGE_QUEUES
+        if (register_client(name, actor_id) == -1)
+            goto fail;
+        joined = 1;
+#else
         if (session->server <= 0) {
             errno = EPROTO;
             goto fail;
@@ -352,15 +483,21 @@ int main(int argc, char **argv)
             errno = duplicate ? EEXIST : EINVAL;
             goto fail;
         }
-        if (send_message(0, (Message){ REGISTER, actor_id, (int)getpid() }) == -1)
+        if (send_message(0, (Message){ .kind = REGISTER, .actor = actor_id,
+                                     .value = (int)getpid() }) == -1)
             goto fail;
+#endif
         Message message;
         if (receive_message(actor_id, &message) == -1 || message.kind != START) {
             if (!stop_signal)
                 errno = EPROTO;
             goto fail;
         }
+#ifdef MESSAGE_QUEUES
+        started = message.started;
+#else
         started = session->started;
+#endif
         if (actor_main(actor_id) == -1)
             goto fail;
         result = 0;
@@ -372,7 +509,7 @@ int main(int argc, char **argv)
     if (clock_gettime(CLOCK_MONOTONIC, &started) == -1)
         goto fail;
     have_clock = 1;
-    if (semaphore_name(sem_name, sizeof sem_name, name, 2 * count) == -1)
+    if (object_name(sem_name, sizeof sem_name, name, SIZE_MAX) == -1)
         goto fail;
     ready = sem_open(sem_name, O_CREAT | O_EXCL, 0600, 0U);
     if (ready == SEM_FAILED)
@@ -383,16 +520,35 @@ int main(int argc, char **argv)
     if (dprintf(STDOUT_FILENO, "Готово: сеанс %s; запустите участников 1..%d\n",
                 argv[2], actors) < 0)
         goto fail;
-    for (int connected = 0; connected < actors; ++connected) {
+    int connected = 0;
+    while (connected < actors) {
         Message message;
         if (receive_message(0, &message) == -1)
             goto fail;
-        if (message.kind != REGISTER || message.actor < 1 || message.actor > actors ||
-            message.value <= 0 || pids[message.actor - 1]) {
+        if (message.kind != REGISTER || message.value <= 0) {
             errno = EPROTO;
             goto fail;
         }
+        int error = 0;
+        if (message.actor < 1 || message.actor > actors)
+            error = EINVAL;
+        else if (pids[message.actor - 1])
+            error = EEXIST;
+#ifdef MESSAGE_QUEUES
+        else if (memcmp(&config, &message.config, sizeof config) != 0)
+            error = EINVAL;
+        if (registration_reply(name, (pid_t)message.value, error) == -1)
+            goto fail;
+        if (error)
+            continue;
+#else
+        if (error) {
+            errno = error;
+            goto fail;
+        }
+#endif
         pids[message.actor - 1] = (pid_t)message.value;
+        ++connected;
     }
 #endif
     if (clock_gettime(CLOCK_MONOTONIC, &started) == -1)
@@ -401,7 +557,7 @@ int main(int argc, char **argv)
 #ifdef INDEPENDENT
     session->started = started;
     for (int actor = 1; actor <= actors; ++actor) {
-        if (send_message(actor, (Message){ START, 0, 0 }) == -1)
+        if (send_message(actor, (Message){ .kind = START, .started = started }) == -1)
             goto fail;
     }
 #else
@@ -433,7 +589,7 @@ int main(int argc, char **argv)
     closing = 1;
 #endif
     for (int actor = 1; actor <= actors; ++actor) {
-        if (send_message(actor, (Message){ STOP, 0, 0 }) == -1)
+        if (send_message(actor, (Message){ .kind = STOP }) == -1)
             goto fail;
     }
     result = 0;
@@ -449,7 +605,8 @@ cleanup:;
     if (!can_wait)
         result = 1;
     if (client) {
-        if (joined && can_wait && send_message(0, (Message){ BYE, actor_id, result }) == -1)
+        if (joined && can_wait && send_message(0, (Message){ .kind = BYE,
+                .actor = actor_id, .value = result }) == -1)
             result = 1;
     } else if (pids) {
         if (result != 0 || saved_signal) {
@@ -507,7 +664,7 @@ cleanup:;
             perror("sem_close");
             result = 1;
         }
-        if (created && (semaphore_name(sem_name, sizeof sem_name, name, initialized) == -1 ||
+        if (created && (object_name(sem_name, sizeof sem_name, name, initialized) == -1 ||
             sem_unlink(sem_name) == -1)) {
             perror("sem_unlink");
             result = 1;
@@ -524,11 +681,38 @@ cleanup:;
         perror("sem_close ready");
         result = 1;
     }
-    if (ready_created && (semaphore_name(sem_name, sizeof sem_name, name, 2 * count) == -1 ||
+    if (ready_created && (object_name(sem_name, sizeof sem_name, name, SIZE_MAX) == -1 ||
         sem_unlink(sem_name) == -1)) {
         perror("sem_unlink ready");
         result = 1;
     }
+#endif
+#ifdef MESSAGE_QUEUES
+    if (reply_queue != (mqd_t)-1 && mq_close(reply_queue) == -1) {
+        perror("mq_close reply");
+        result = 1;
+    }
+    if (reply_created && mq_unlink(reply_name) == -1 && errno != ENOENT) {
+        perror("mq_unlink reply");
+        result = 1;
+    }
+    while (opened_queues > 0) {
+        --opened_queues;
+        if (mq_close(queues[opened_queues]) == -1) {
+            perror("mq_close");
+            result = 1;
+        }
+        if (created && (object_name(sem_name, sizeof sem_name, name, opened_queues) == -1 ||
+            mq_unlink(sem_name) == -1)) {
+            perror("mq_unlink");
+            result = 1;
+        }
+    }
+    free(queues);
+    if (session != MAP_FAILED)
+        free(session);
+#else
+#ifdef INDEPENDENT
     if (session != MAP_FAILED && munmap(session, size) == -1) {
 #else
     if (boxes != MAP_FAILED && munmap(boxes, size) == -1) {
@@ -536,14 +720,17 @@ cleanup:;
         perror("munmap");
         result = 1;
     }
+#endif
     if (fd != -1 && close(fd) == -1) {
         perror("close shm");
         result = 1;
     }
+#ifndef MESSAGE_QUEUES
     if (created && shm_unlink(name) == -1) {
         perror("shm_unlink");
         result = 1;
     }
+#endif
     if (log_fd != -1 && close(log_fd) == -1) {
         perror("close log");
         result = 1;

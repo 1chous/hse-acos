@@ -4,16 +4,18 @@
 #include <signal.h>
 #include <time.h>
 
-enum { APPEAR, MOVE, OPEN, CLOSE, BOARD, LEAVE, STOP, REGISTER, START, BYE };
-
-typedef struct {
-    int kind, actor, value;
-} Message;
+enum { APPEAR, MOVE, OPEN, CLOSE, BOARD, LEAVE, STOP, REGISTER, START, BYE, REJECT };
 
 typedef struct {
     int floors, lifts, capacity, passengers, seed, strategy;
     int arrival_min, arrival_max, travel_ms, door_ms, board_ms, leave_ms;
 } Config;
+
+typedef struct {
+    int kind, actor, value;
+    Config config;              /* Параметры участника при регистрации. */
+    struct timespec started;    /* Общее время старта в сообщении START. */
+} Message;
 
 extern Config config;
 extern struct timespec started;
