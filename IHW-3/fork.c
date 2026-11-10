@@ -13,12 +13,39 @@
 
 enum { CAN_WRITE, CAN_READ };
 typedef struct {
+#ifndef NAMED_SEMAPHORES
     sem_t sem[2];
+#endif
     Message message;
 } Mailbox;
 
 static Mailbox *boxes = MAP_FAILED;
 static int closing;
+
+#ifdef NAMED_SEMAPHORES
+/* Указатели остаются в обычной памяти и наследуются детьми при fork.
+ * В разделяемой памяти этой версии находятся только сообщения. */
+static sem_t **semaphores;
+
+static int semaphore_name(char *buffer, size_t size, const char *prefix, size_t index)
+{
+    int length = snprintf(buffer, size, "%s_%zu", prefix, index);
+    if (length < 0 || (size_t)length >= size) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    return 0;
+}
+#endif
+
+static sem_t *box_sem(int receiver, int operation)
+{
+#ifdef NAMED_SEMAPHORES
+    return semaphores[2 * (size_t)receiver + operation];
+#else
+    return &boxes[receiver].sem[operation];
+#endif
+}
 
 static void handle_signal(int signal_number)
 {
@@ -53,19 +80,19 @@ static int wait_sem(sem_t *sem)
 int send_message(int receiver, Message message)
 {
     Mailbox *box = &boxes[receiver];
-    if (wait_sem(&box->sem[CAN_WRITE]) == -1)
+    if (wait_sem(box_sem(receiver, CAN_WRITE)) == -1)
         return -1;
     box->message = message;
-    return sem_post(&box->sem[CAN_READ]);
+    return sem_post(box_sem(receiver, CAN_READ));
 }
 
 int receive_message(int receiver, Message *message)
 {
     Mailbox *box = &boxes[receiver];
-    if (wait_sem(&box->sem[CAN_READ]) == -1)
+    if (wait_sem(box_sem(receiver, CAN_READ)) == -1)
         return -1;
     *message = box->message;
-    return sem_post(&box->sem[CAN_WRITE]);
+    return sem_post(box_sem(receiver, CAN_WRITE));
 }
 
 int main(int argc, char **argv)
@@ -98,6 +125,9 @@ int main(int argc, char **argv)
     size_t count = (size_t)actors + 1, size = 0;
     pid_t *pids = NULL;
     char name[64];
+#ifdef NAMED_SEMAPHORES
+    char sem_name[96];
+#endif
     int length = snprintf(name, sizeof name, "/acos03_%ld", (long)getpid());
     if (length < 0 || (size_t)length >= sizeof name) {
         errno = EOVERFLOW;
@@ -131,10 +161,24 @@ int main(int argc, char **argv)
     fd = -1;
     if (close_result == -1)
         goto fail;
+#ifdef NAMED_SEMAPHORES
+    semaphores = calloc(2 * count, sizeof *semaphores);
+    if (!semaphores)
+        goto fail;
+#endif
     for (; initialized < 2 * count; ++initialized) {
+#ifdef NAMED_SEMAPHORES
+        if (semaphore_name(sem_name, sizeof sem_name, name, initialized) == -1)
+            goto fail;
+        semaphores[initialized] = sem_open(sem_name, O_CREAT | O_EXCL, 0600,
+                                          (unsigned)(initialized % 2 == CAN_WRITE));
+        if (semaphores[initialized] == SEM_FAILED)
+            goto fail;
+#else
         sem_t *sem = &boxes[initialized / 2].sem[initialized % 2];
         if (sem_init(sem, 1, initialized % 2 == CAN_WRITE) == -1)
             goto fail;
+#endif
     }
     if (clock_gettime(CLOCK_MONOTONIC, &started) == -1)
         goto fail;
@@ -194,10 +238,22 @@ cleanup:
     }
     while (initialized > 0) {
         --initialized;
+#ifdef NAMED_SEMAPHORES
+        if (sem_close(semaphores[initialized]) == -1) {
+            perror("sem_close");
+            result = 1;
+        }
+        if (semaphore_name(sem_name, sizeof sem_name, name, initialized) == -1 ||
+            sem_unlink(sem_name) == -1) {
+            perror("sem_unlink");
+            result = 1;
+        }
+#else
         if (sem_destroy(&boxes[initialized / 2].sem[initialized % 2]) == -1) {
             perror("sem_destroy");
             result = 1;
         }
+#endif
     }
     if (boxes != MAP_FAILED && munmap(boxes, size) == -1) {
         perror("munmap");
@@ -216,6 +272,9 @@ cleanup:
         result = 1;
     }
     free(pids);
+#ifdef NAMED_SEMAPHORES
+    free(semaphores);
+#endif
     free_model();
     return stop_signal ? 128 + stop_signal : result;
 }
