@@ -4,7 +4,7 @@
 #include <signal.h>
 #include <time.h>
 
-enum { APPEAR, MOVE, OPEN, CLOSE, BOARD, LEAVE, STOP };
+enum { APPEAR, MOVE, OPEN, CLOSE, BOARD, LEAVE, STOP, REGISTER, START, BYE };
 
 typedef struct {
     int kind, actor, value;
